@@ -58,7 +58,7 @@ public class StateProjectionGrain : Grain, IProjectionGrain
     
     private IAsyncStream<StateWrapper<StateBase>> GetStateProjectionStream()
     {
-        var streamId = StreamId.Create(AevatarOptions.StreamNamespace, StateTypeName);
+        var streamId = StreamId.Create(AevatarOptions.ProjectorStreamNamespace, StateTypeName);
         return StreamProvider.GetStream<StateWrapper<StateBase>>(streamId);
     }
 }

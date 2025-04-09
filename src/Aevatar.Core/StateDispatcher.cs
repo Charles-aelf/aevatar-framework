@@ -18,7 +18,7 @@ public class StateDispatcher : IStateDispatcher
 
     public async Task PublishAsync<TState>(GrainId grainId, StateWrapper<TState> stateWrapper) where TState : StateBase
     {
-        var streamId = StreamId.Create(_aevatarOptions.StreamNamespace, typeof(StateWrapper<TState>).FullName!);
+        var streamId = StreamId.Create(_aevatarOptions.ProjectorStreamNamespace, typeof(StateWrapper<TState>).FullName!);
         var stream = _streamProvider.GetStream<StateWrapper<TState>>(streamId);
         await stream.OnNextAsync(stateWrapper);
     }
