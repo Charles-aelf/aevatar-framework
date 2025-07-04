@@ -6,6 +6,7 @@ using Orleans.Streams;
 using Orleans.Streams.Kafka.Config;
 using Orleans.Providers;
 using System;
+using System.Linq;
 using Aevatar.Core.Streaming.Monitors;
 using Aevatar.Core.Streaming.Kafka;
 using Orleans.Providers.Streams.Common;
@@ -91,6 +92,7 @@ namespace Aevatar.Core.Streaming.Extensions
     {
         /// <summary>
         /// Adds a monitored Kafka stream provider to the silo builder.
+        /// Automatically configures Orleans queue count to match Kafka partitions for optimal load distribution.
         /// </summary>
         /// <param name="builder">The silo builder</param>
         /// <param name="name">The stream provider name</param>
@@ -109,9 +111,28 @@ namespace Aevatar.Core.Streaming.Extensions
                 throw new ArgumentNullException(nameof(name));
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Stream provider name cannot be empty or whitespace.", nameof(name));
+            
             return builder.ConfigureServices(services =>
             {
                 services.AddAevatarStreamingMonitoring();
+                
+                // Configure Orleans queue count to match Kafka partitions
+                if (configureOptions != null)
+                {
+                    var kafkaOptions = new KafkaStreamOptions();
+                    configureOptions(kafkaOptions);
+                    
+                    // Get the maximum partition count from all configured topics
+                    var maxPartitions = kafkaOptions.Topics?.Any() == true 
+                        ? kafkaOptions.Topics.Max(topic => topic.Partitions) 
+                        : 8;
+                    
+                    // Configure Orleans queue count to match Kafka partitions
+                    services.Configure<HashRingStreamQueueMapperOptions>(name, options =>
+                    {
+                        options.TotalQueueCount = maxPartitions;
+                    });
+                }
             })
             .AddPersistentStreams(name, AevatarKafkaAdapterFactory.Create, b =>
             {
@@ -133,6 +154,7 @@ namespace Aevatar.Core.Streaming.Extensions
     {
         /// <summary>
         /// Adds a monitored Kafka stream provider to the client builder.
+        /// Automatically configures Orleans queue count to match Kafka partitions for optimal load distribution.
         /// </summary>
         /// <param name="builder">The client builder</param>
         /// <param name="name">The stream provider name</param>
@@ -151,9 +173,28 @@ namespace Aevatar.Core.Streaming.Extensions
                 throw new ArgumentNullException(nameof(name));
             if (string.IsNullOrWhiteSpace(name))
                 throw new ArgumentException("Stream provider name cannot be empty or whitespace.", nameof(name));
+            
             return builder.ConfigureServices(services =>
             {
                 services.AddAevatarStreamingMonitoring();
+                
+                // Configure Orleans queue count to match Kafka partitions
+                if (configureOptions != null)
+                {
+                    var kafkaOptions = new KafkaStreamOptions();
+                    configureOptions(kafkaOptions);
+                    
+                    // Get the maximum partition count from all configured topics
+                    var maxPartitions = kafkaOptions.Topics?.Any() == true 
+                        ? kafkaOptions.Topics.Max(topic => topic.Partitions) 
+                        : 8;
+                    
+                    // Configure Orleans queue count to match Kafka partitions
+                    services.Configure<HashRingStreamQueueMapperOptions>(name, options =>
+                    {
+                        options.TotalQueueCount = maxPartitions;
+                    });
+                }
             })
             .AddPersistentStreams(name, AevatarKafkaAdapterFactory.Create, b =>
             {

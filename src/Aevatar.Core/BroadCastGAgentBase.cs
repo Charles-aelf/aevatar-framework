@@ -6,10 +6,13 @@ using Aevatar.Core.Abstractions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using System.Collections.Generic;
+using Orleans.Configuration;
+using Microsoft.Extensions.Options;
 
 public interface IBroadCastGAgent : IGAgent
 {
     Task BroadCastEventAsync<T>(string streamIdString, T @event) where T : EventBase;
+    Task BroadCastEventAsync<T>(string streamIdString, T @event, bool useMultiStreamDistribution) where T : EventBase;
 }
 
 public abstract class BroadCastGAgentBase<TBroadCastState, TBroadCastStateLogEvent>
@@ -21,6 +24,9 @@ public abstract class BroadCastGAgentBase<TBroadCastState, TBroadCastStateLogEve
     private readonly Dictionary<string, Guid> _pendingSubscriptions = new();
     private readonly Dictionary<string, StreamSubscriptionHandle<EventWrapperBase>> _pendingHandles = new();
     private readonly List<Task> _pendingOperations = new();
+
+    // Multi-stream distribution configuration
+    private int _streamDistributionCount = 8; // Default to 8 streams to match default Orleans queues
 
     [GenerateSerializer]
     public class SubscribeStateLogEvent : StateLogEventBase<TBroadCastStateLogEvent>
@@ -58,7 +64,92 @@ public abstract class BroadCastGAgentBase<TBroadCastState, TBroadCastStateLogEve
     }
 
     /// <summary>
-    /// 
+    /// Configures the number of streams for multi-stream distribution.
+    /// Should match the number of Orleans queues/partitions for optimal load balancing.
+    /// </summary>
+    /// <param name="streamCount">Number of streams to distribute across</param>
+    protected void ConfigureMultiStreamDistribution(int streamCount)
+    {
+        if (streamCount <= 0)
+            throw new ArgumentException("Stream count must be positive", nameof(streamCount));
+        
+        _streamDistributionCount = streamCount;
+        Logger.LogInformation("[{0}.{1}]Configured multi-stream distribution with {2} streams", 
+            this.GetType().Name, nameof(ConfigureMultiStreamDistribution), streamCount);
+    }
+
+    /// <summary>
+    /// Automatically configures multi-stream distribution to match Orleans queue count.
+    /// This ensures optimal load balancing across all available Orleans queues/agents.
+    /// </summary>
+    /// <param name="providerName">The stream provider name (e.g., "Aevatar")</param>
+    protected void ConfigureMultiStreamDistributionAuto(string providerName = "Aevatar")
+    {
+        try
+        {
+            // Try to get the Orleans queue mapper options
+            var optionsMonitor = ServiceProvider.GetService<IOptionsMonitor<HashRingStreamQueueMapperOptions>>();
+            if (optionsMonitor != null)
+            {
+                var queueMapperOptions = optionsMonitor.Get(providerName);
+                if (queueMapperOptions != null && queueMapperOptions.TotalQueueCount > 0)
+                {
+                    ConfigureMultiStreamDistribution(queueMapperOptions.TotalQueueCount);
+                    Logger.LogInformation("[{0}.{1}]Auto-configured multi-stream distribution with {2} streams (matching Orleans queue count)", 
+                        this.GetType().Name, nameof(ConfigureMultiStreamDistributionAuto), queueMapperOptions.TotalQueueCount);
+                    return;
+                }
+            }
+            
+            // Fallback: Use default Orleans queue count
+            Logger.LogWarning("[{0}.{1}]Could not retrieve Orleans queue configuration, using default of 8 streams", 
+                this.GetType().Name, nameof(ConfigureMultiStreamDistributionAuto));
+            ConfigureMultiStreamDistribution(8);
+        }
+        catch (Exception ex)
+        {
+            Logger.LogError(ex, "[{0}.{1}]Error auto-configuring multi-stream distribution, using default of 8 streams", 
+                this.GetType().Name, nameof(ConfigureMultiStreamDistributionAuto));
+            ConfigureMultiStreamDistribution(8);
+        }
+    }
+
+    /// <summary>
+    /// Broadcasts an event to all subscribers with optional multi-stream distribution
+    /// </summary>
+    /// <typeparam name="T">The type of event</typeparam>
+    /// <param name="streamIdString">The stream identifier string</param>
+    /// <param name="event">The event to broadcast</param>
+    /// <param name="useMultiStreamDistribution">Whether to use multi-stream distribution for high fan-out scenarios</param>
+    /// <returns></returns>
+    public async Task BroadCastEventAsync<T>(string streamIdString, T @event, bool useMultiStreamDistribution) where T : EventBase
+    {
+        if (useMultiStreamDistribution)
+        {
+            // Broadcast to all distribution streams
+            var tasks = new List<Task>();
+            for (int i = 0; i < _streamDistributionCount; i++)
+            {
+                var distributedStreamId = GetDistributedStreamIdString<T>(streamIdString, i);
+                var stream = GenStreamByStreamId<T>(distributedStreamId);
+                var eventWrapper = new EventWrapper<T>(@event, Guid.NewGuid(), this.GetGrainId());
+                eventWrapper.PublishedTimestampUtc = DateTime.UtcNow;
+                tasks.Add(stream.OnNextAsync(eventWrapper));
+            }
+            
+            await Task.WhenAll(tasks);
+            Logger.LogInformation("[{0}.{1}]Broadcasted event to {2} distributed streams", 
+                this.GetType().Name, nameof(BroadCastEventAsync), _streamDistributionCount);
+        }
+        else
+        {
+            // Use original single-stream broadcasting
+            await BroadCastEventAsync(streamIdString, @event);
+        }
+    }
+
+    /// <summary>
+    /// Original broadcast method - broadcasts to single stream
     /// </summary>
     /// <typeparam name="T"></typeparam>
     /// <param name="streamIdString"></param>
@@ -87,7 +178,36 @@ public abstract class BroadCastGAgentBase<TBroadCastState, TBroadCastStateLogEve
     }
 
     /// <summary>
-    /// Subscribe to a broadcast event and returns the subscription handle
+    /// Subscribe to a broadcast event with multi-stream distribution support
+    /// </summary>
+    /// <typeparam name="T">The type of event to listen on</typeparam>
+    /// <param name="agentType">The name of agent which published the event</param>
+    /// <param name="eventHandler">The method that processes the event</param>
+    /// <param name="useMultiStreamDistribution">Whether to use multi-stream distribution for high fan-out scenarios</param>
+    /// <returns>The subscription handle</returns>
+    protected async Task<StreamSubscriptionHandle<EventWrapperBase>> SubscribeBroadCastEventAsync<T>(
+        string agentType, Func<T, Task> eventHandler, bool useMultiStreamDistribution) where T : EventBase
+    {
+        if (useMultiStreamDistribution)
+        {
+            // Subscribe to distributed stream based on this grain's ID
+            var distributedStreamIndex = GetDistributedStreamIndex();
+            var distributedStreamId = GetDistributedStreamIdString<T>(agentType, distributedStreamIndex);
+            
+            Logger.LogInformation("[{0}.{1}]Subscribing to distributed stream {2} (index {3})", 
+                this.GetType().Name, nameof(SubscribeBroadCastEventAsync), distributedStreamId, distributedStreamIndex);
+            
+            return await SubscribeBroadCastEventByStreamId<T>(distributedStreamId, eventHandler);
+        }
+        else
+        {
+            // Use original single-stream subscription
+            return await SubscribeBroadCastEventAsync(agentType, eventHandler);
+        }
+    }
+
+    /// <summary>
+    /// Subscribe to a broadcast event using original single-stream method
     /// </summary>
     protected async Task<StreamSubscriptionHandle<EventWrapperBase>> SubscribeBroadCastEventAsync<T>(string agentType, Func<T, Task> eventHandler) where T : EventBase
     {
@@ -107,6 +227,101 @@ public abstract class BroadCastGAgentBase<TBroadCastState, TBroadCastStateLogEve
         {
             throw new InvalidOperationException("No handles found");
         }
+    }
+
+    /// <summary>
+    /// Subscribe to a broadcast event using a specific stream ID
+    /// </summary>
+    private async Task<StreamSubscriptionHandle<EventWrapperBase>> SubscribeBroadCastEventByStreamId<T>(
+        string streamIdString, Func<T, Task> eventHandler) where T : EventBase
+    {
+        var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+        long getHandlesCost = 0;
+        long resumeCost = 0;
+        long subscribeCost = 0;
+        var stream = GenStreamByStreamId<T>(streamIdString);
+
+        var logger = ServiceProvider.GetService<ILoggerFactory>()?.CreateLogger<EventWrapperBaseAsyncObserver>();
+        if (logger == null)
+        {
+            Logger.LogWarning("[{0}.{1}]EventWrapperBaseAsyncObserver Logger is null", this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId));
+        }
+
+        // Create an observer that will handle the events
+        var observer = EventWrapperBaseAsyncObserver.Create(
+            async item =>
+            {
+                var eventWrapper = item as EventWrapper<T>;
+                if (eventWrapper == null)
+                {
+                    Logger.LogWarning("[{0}.{1}]EventWrapperBaseAsyncObserver eventWrapper is null", this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId));
+                    return;
+                }
+
+                await eventHandler.Invoke(eventWrapper.Event);
+            }, ServiceProvider, eventHandler.Method.Name, typeof(T).Name);
+
+        var key = streamIdString;
+
+        StreamSubscriptionHandle<EventWrapperBase> handle;
+        
+        if (State.Subscription.TryGetValue(key, out Guid handleId))
+        {
+            Logger.LogWarning("[{0}.{1}]Subscription {2} already exists", this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId), key);
+            var getHandlesStart = stopwatch.ElapsedMilliseconds;
+            var handles = await stream.GetAllSubscriptionHandles();
+            getHandlesCost = stopwatch.ElapsedMilliseconds - getHandlesStart;
+            var resumeHandles = handles.Where(h => h.HandleId == handleId).ToList();
+            if (resumeHandles.IsNullOrEmpty())
+            {
+                Logger.LogWarning("[{0}.{1}]Unable to locate handle {2} to be resumed, continue to subscribe", this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId), handleId);
+            }
+            else if (resumeHandles.Count > 1)
+            {
+                Logger.LogError("[{0}.{1}]Multiple handles found for {2} to be resumed", this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId), handleId);
+                throw new InvalidOperationException($"Multiple handles found for {handleId} to be resumed");
+            }
+            else
+            {
+                var resumeStart = stopwatch.ElapsedMilliseconds;
+                handle = await resumeHandles.First().ResumeAsync(observer);
+                resumeCost = stopwatch.ElapsedMilliseconds - resumeStart;
+                
+                // Store the handle for later cleanup
+                var subscribeEvent = new SubscribeStateLogEvent
+                {
+                    Key = key,
+                    Value = handle.HandleId
+                };
+                RaiseEvent(subscribeEvent);
+                await ConfirmEvents();
+                
+                stopwatch.Stop();
+                Logger.LogDebug("[{0}.{1}]Timing: GetAllSubscriptionHandles: {2}ms, ResumeAsync: {3}ms", 
+                    this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId), getHandlesCost, resumeCost);
+                return handle;
+            }
+        }
+
+        var subscribeStart = stopwatch.ElapsedMilliseconds;
+        handle = await stream.SubscribeAsync(observer);
+        subscribeCost = stopwatch.ElapsedMilliseconds - subscribeStart;
+        Logger.LogInformation("[{0}.{1}]Subscription {2} created", this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId), key);
+        
+        // Store the subscription
+        var subscribeStateEvent = new SubscribeStateLogEvent
+        {
+            Key = key,
+            Value = handle.HandleId
+        };
+        RaiseEvent(subscribeStateEvent);
+        await ConfirmEvents();
+        
+        stopwatch.Stop();
+        Logger.LogDebug("[{0}.{1}]Timing: GetAllSubscriptionHandles: {2}ms, ResumeAsync: {3}ms, SubscribeAsync: {4}ms", 
+            this.GetType().Name, nameof(SubscribeBroadCastEventByStreamId), getHandlesCost, resumeCost, subscribeCost);
+        
+        return handle;
     }
 
     /// <summary>
@@ -404,6 +619,44 @@ public abstract class BroadCastGAgentBase<TBroadCastState, TBroadCastStateLogEve
         }
         //call base class to handle the state transition if any
         base.GAgentTransitionState(state, @event);
+    }
+
+    /// <summary>
+    /// Calculates which distributed stream this grain should subscribe to based on its grain ID
+    /// </summary>
+    /// <returns>The stream index (0 to _streamDistributionCount-1)</returns>
+    private int GetDistributedStreamIndex()
+    {
+        var grainId = this.GetGrainId();
+        var hash = grainId.GetHashCode();
+        // Use absolute value to handle negative hash codes
+        var index = Math.Abs(hash) % _streamDistributionCount;
+        return index;
+    }
+
+    /// <summary>
+    /// Generates a distributed stream ID string for a specific stream index
+    /// </summary>
+    /// <typeparam name="T">The event type</typeparam>
+    /// <param name="grType">The grain type/agent type</param>
+    /// <param name="streamIndex">The stream index (0 to _streamDistributionCount-1)</param>
+    /// <returns>The distributed stream ID string</returns>
+    private string GetDistributedStreamIdString<T>(string grType, int streamIndex)
+    {
+        var streamIdString = grType + "." + typeof(T).Name + ".Stream" + streamIndex;
+        return streamIdString;
+    }
+
+    /// <summary>
+    /// Creates a stream using a specific stream ID string
+    /// </summary>
+    /// <typeparam name="T">The event type</typeparam>
+    /// <param name="streamIdString">The complete stream ID string</param>
+    /// <returns>The async stream</returns>
+    private IAsyncStream<EventWrapperBase> GenStreamByStreamId<T>(string streamIdString)
+    {
+        var streamId = StreamId.Create(AevatarOptions!.BroadCastStreamNamespace, streamIdString);
+        return StreamProvider.GetStream<EventWrapperBase>(streamId);
     }
 
     private IAsyncStream<EventWrapperBase> GenStream<T>(string grType)
